@@ -1,0 +1,20 @@
+[package]
+name = "cc-top"
+version = "1.0.0"
+edition = "2024"
+description = "A terminal dashboard in the style of top for AI coding agents. It shows live context, token usage, rate limits and file activity."
+license = "Apache-2.0"
+repository = "https://github.com/alejandroqh/cc-top"
+homepage = "https://github.com/alejandroqh/cc-top"
+readme = "README.md"
+keywords = ["claude-code", "opencode", "tui", "monitor", "htop"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "cc-top"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system", "network"] }
