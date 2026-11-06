@@ -63,6 +63,84 @@ const ICON_TOKENS: &str = "\u{f06d}"; // fire
 const ICON_ACTIVITY: &str = "\u{f1da}"; // history
 const ICON_REPO: &str = "\u{f07b}"; // folder
 
+// Before every panel's icon: click it to collapse the panel to a summary, or to expand it again.
+const EXPANDED: &str = "▾";
+const COLLAPSED: &str = "▸";
+
+/// The panels, top to bottom, as far as collapsing goes. Every Repo panel collapses together:
+/// the state is saved, and session ids change from one run to the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Panel {
+    System,
+    Network,
+    Limits,
+    Sessions,
+    Tokens,
+    Activity,
+    Repo,
+}
+
+impl Panel {
+    const ALL: [Panel; 7] = [
+        Panel::System,
+        Panel::Network,
+        Panel::Limits,
+        Panel::Sessions,
+        Panel::Tokens,
+        Panel::Activity,
+        Panel::Repo,
+    ];
+
+    /// Its line in the saved state.
+    fn key(self) -> &'static str {
+        match self {
+            Panel::System => "system",
+            Panel::Network => "network",
+            Panel::Limits => "limits",
+            Panel::Sessions => "sessions",
+            Panel::Tokens => "tokens",
+            Panel::Activity => "activity",
+            Panel::Repo => "repo",
+        }
+    }
+}
+
+/// What a click on the page does: collapse or expand a panel (its top border, where the title
+/// is), or list a folder in a session's Repo.
+#[derive(Debug, PartialEq)]
+enum Click {
+    Fold(Panel),
+    Open(usize, PathBuf),
+}
+
+/// Where the collapsed panels are saved, one per line. It has no extension, so neither the rate
+/// limits (`claude::quota`) nor the 7-day cleanup of payloads take it for one.
+fn collapsed_file(dir: &Path) -> PathBuf {
+    dir.join("cc-top").join("collapsed")
+}
+
+fn load_collapsed(file: &Path) -> HashSet<Panel> {
+    let text = fs::read_to_string(file).unwrap_or_default();
+    let saved: HashSet<&str> = text.lines().map(str::trim).collect();
+    Panel::ALL
+        .into_iter()
+        .filter(|p| saved.contains(p.key()))
+        .collect()
+}
+
+/// Best effort: when it can't be saved, the panel still stays collapsed until cc-top quits.
+fn save_collapsed(file: &Path, collapsed: &HashSet<Panel>) {
+    let text: String = Panel::ALL
+        .into_iter()
+        .filter(|p| collapsed.contains(p))
+        .map(|p| format!("{}\n", p.key()))
+        .collect();
+    if let Some(dir) = file.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(file, text);
+}
+
 fn main() -> std::io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         None => {}
@@ -100,6 +178,8 @@ fn main() -> std::io::Result<()> {
     // How far the page is scrolled, and where it shows.
     let (mut scroll, mut view) = (0u16, Rect::default());
     let mut zoom = ZOOM_START; // index into ZOOM
+    let saved = collapsed_file(&dir);
+    let mut collapsed = load_collapsed(&saved);
     let start = Instant::now();
     let mut next_frame = start;
     // Clicks open folders in Repo. While the mouse is captured, selecting text in the terminal
@@ -139,7 +219,7 @@ fn main() -> std::io::Result<()> {
                         quota.as_ref(),
                         &listings,
                         (spin, ZOOM[zoom]),
-                        &mut scroll,
+                        (&collapsed, &mut scroll),
                     );
                 })?;
                 next_frame = Instant::now() + TICK;
@@ -170,11 +250,19 @@ fn main() -> std::io::Result<()> {
                         let on_page = view
                             .contains(at)
                             .then(|| Position::new(at.x - view.x, at.y - view.y + scroll));
-                        if let Some(p) = on_page
-                            && let Some((_, i, folder)) = hits.iter().find(|(r, ..)| r.contains(p))
-                        {
-                            browse.insert(sessions[*i].id.clone(), folder.clone());
-                            collected = None; // list it right away
+                        match on_page.and_then(|p| hits.iter().find(|(r, _)| r.contains(p))) {
+                            Some((_, Click::Fold(panel))) => {
+                                if !collapsed.remove(panel) {
+                                    collapsed.insert(*panel);
+                                }
+                                save_collapsed(&saved, &collapsed);
+                                next_frame = Instant::now();
+                            }
+                            Some((_, Click::Open(i, folder))) => {
+                                browse.insert(sessions[*i].id.clone(), folder.clone());
+                                collected = None; // list it right away
+                            }
+                            None => {}
                         }
                     }
                     _ => {}
@@ -192,8 +280,9 @@ fn main() -> std::io::Result<()> {
 
 /// Draws everything; `listings` has each session's Repo folder and what it holds. The panels go on
 /// a page as tall as they need, and the main window shows it from row `scroll` on, which this
-/// clamps. `spin` counts redraw ticks, and `secs` is a Tokens column. Returns where the page shows,
-/// and where on the page each folder box in Repo is, the session it belongs to and the folder it opens.
+/// clamps; the panels in `collapsed` show a summary. `spin` counts redraw ticks, and `secs` is a
+/// Tokens column. Returns where the page shows, and what a click does where on the page: each
+/// panel's top border collapses or expands it, and each folder box in Repo lists its folder.
 fn draw(
     frame: &mut Frame,
     machine: &Machine,
@@ -201,8 +290,8 @@ fn draw(
     quota: Option<&Quota>,
     listings: &[(PathBuf, Vec<(String, bool)>)],
     (spin, secs): (usize, u64),
-    scroll: &mut u16,
-) -> (Rect, Vec<(Rect, usize, PathBuf)>) {
+    (collapsed, scroll): (&HashSet<Panel>, &mut u16),
+) -> (Rect, Vec<(Rect, Click)>) {
     let area = frame.area();
     let view = area.inner(Margin::new(1, 1)); // inside the main border
     let width = view.width.saturating_sub(4); // panel borders + padding
@@ -213,22 +302,26 @@ fn draw(
         .iter()
         .map(|(_, entries)| repo_boxes(entries, width))
         .collect();
-    let mut heights = vec![
-        cpu_grid.1 as u16 + 1 + 2, // the cores, then memory
-        (2 * STRIP_ROWS) as u16 + 2,
-        4,
-        rows.max(1) as u16 * 2 + 2, // the meter, then the info line
-        (sessions.len().max(1) * 2 * STRIP_ROWS) as u16 + 2, // in, then out
-        ACTIVITY as u16 + 2,
+    let shut = |p: Panel| collapsed.contains(&p);
+    // Each panel and the rows inside its border: all of it, or its summary while collapsed.
+    let pick = |p: Panel, open: usize, summary: usize| (p, if shut(p) { summary } else { open });
+    let n = sessions.len().max(1);
+    let mut panels = vec![
+        pick(Panel::System, cpu_grid.1 + 1, 1), // the cores, then memory; or side by side
+        pick(Panel::Network, 2 * STRIP_ROWS, 1), // ↑ then ↓; or side by side, 1 row tall
+        pick(Panel::Limits, 2, 1),              // 5h then 7d; or side by side
+        pick(Panel::Sessions, rows.max(1) * 2, rows.max(1)), // the meter, then the info line
+        pick(Panel::Tokens, n * 2 * STRIP_ROWS, n * 2), // in, then out; 1 row tall
+        pick(Panel::Activity, ACTIVITY, 1),     // the newest call
     ];
-    heights.extend(
-        boxes
-            .iter()
-            .map(|b| b.last().map_or(3, |(_, r)| r.bottom()) + 2),
-    );
-    if sessions.is_empty() {
-        heights.push(3); // Repo, empty
+    for b in &boxes {
+        let open = b.last().map_or(3, |(_, r)| r.bottom() as usize);
+        panels.push(pick(Panel::Repo, open, 0)); // just its title and note
     }
+    if sessions.is_empty() {
+        panels.push(pick(Panel::Repo, 1, 0)); // "no sessions"
+    }
+    let heights: Vec<u16> = panels.iter().map(|&(_, rows)| rows as u16 + 2).collect();
     let height: u16 = heights.iter().sum();
     let max = height.saturating_sub(view.height);
     *scroll = (*scroll).min(max);
@@ -280,22 +373,52 @@ fn draw(
     let mut constraints: Vec<_> = heights.into_iter().map(Constraint::Length).collect();
     constraints.push(Constraint::Fill(1)); // else the last panel stretches to the bottom
     let areas = Layout::vertical(constraints).split(page);
-    draw_system(&mut buf, areas[0], machine, cpu_grid, spin);
-    draw_network(&mut buf, areas[1], machine);
-    draw_quota(&mut buf, areas[2], quota, now, spin);
-    draw_sessions(&mut buf, areas[3], sessions, (cols, rows), now, spin);
-    draw_tokens(&mut buf, areas[4], sessions, secs, now);
-    draw_activity(&mut buf, areas[5], sessions, now, spin);
+    let mut hits: Vec<(Rect, Click)> = areas
+        .iter()
+        .zip(&panels)
+        .map(|(a, &(p, _))| (Rect { height: 1, ..*a }, Click::Fold(p)))
+        .collect();
+    let b = &mut buf;
+    draw_system(b, areas[0], machine, cpu_grid, spin, shut(Panel::System));
+    draw_network(b, areas[1], machine, shut(Panel::Network));
+    draw_quota(b, areas[2], quota, now, spin, shut(Panel::Limits));
+    let grid = (cols, rows);
+    draw_sessions(
+        b,
+        areas[3],
+        sessions,
+        grid,
+        now,
+        spin,
+        shut(Panel::Sessions),
+    );
+    draw_tokens(b, areas[4], sessions, secs, now, shut(Panel::Tokens));
+    draw_activity(b, areas[5], sessions, now, spin, shut(Panel::Activity));
     let repos = &areas[6..];
     if sessions.is_empty() {
-        let body = draw_panel(&mut buf, panel(ICON_REPO, "Repo", vec![]), repos[0]);
-        empty(&mut buf, body, "no sessions");
+        let body = draw_panel(
+            b,
+            panel(shut(Panel::Repo), ICON_REPO, "Repo", vec![]),
+            repos[0],
+        );
+        empty(b, body, "no sessions");
     }
-    let mut hits = vec![];
     for (i, (s, (at, entries))) in sessions.iter().zip(listings).enumerate() {
         let repo = (i, s, at.as_path());
-        let drawn = draw_repo(&mut buf, repos[i], repo, entries, &boxes[i], now);
-        hits.extend(drawn.into_iter().map(|(rect, folder)| (rect, i, folder)));
+        let drawn = draw_repo(
+            b,
+            repos[i],
+            repo,
+            entries,
+            &boxes[i],
+            now,
+            shut(Panel::Repo),
+        );
+        hits.extend(
+            drawn
+                .into_iter()
+                .map(|(rect, folder)| (rect, Click::Open(i, folder))),
+        );
     }
     for y in 0..view.height {
         for x in 0..view.width {
@@ -371,6 +494,7 @@ fn draw_repo(
     entries: &[(String, bool)],
     boxes: &[(String, Rect)],
     now: u64,
+    collapsed: bool,
 ) -> Vec<(Rect, PathBuf)> {
     let mut name = s
         .cwd
@@ -386,7 +510,7 @@ fn draw_repo(
     let mut title = vec![" · ".fg(FAINT)];
     title.extend(row_label(i + 1, 0));
     title.push(name.fg(TEXT));
-    let mut panel = panel(ICON_REPO, "Repo", title);
+    let mut panel = panel(collapsed, ICON_REPO, "Repo", title);
     if let Some(c) = s.changes.last() {
         let path = c.path.strip_prefix(&s.cwd).unwrap_or(&c.path);
         let age = (now / 1_000).saturating_sub(c.at);
@@ -403,6 +527,9 @@ fn draw_repo(
         panel = with_note(panel, note);
     }
     let body = draw_panel(buf, panel, area);
+    if collapsed {
+        return vec![]; // the title and the note only
+    }
     if entries.is_empty() {
         empty(buf, body, "empty folder");
         return vec![];
@@ -473,17 +600,30 @@ fn cut(s: &str, w: usize) -> String {
     kept.chain((w > 0).then_some('…')).collect()
 }
 
-/// The last ACTIVITY tool calls of all sessions together, newest on top.
-fn draw_activity(buf: &mut Buffer, area: Rect, sessions: &[Session], now: u64, spin: usize) {
-    let extra = vec![format!(" · last {ACTIVITY}").fg(FAINT)];
-    let body = draw_panel(buf, panel(ICON_ACTIVITY, "Activity", extra), area);
+/// The last ACTIVITY tool calls of all sessions together, newest on top; only the newest while
+/// collapsed.
+fn draw_activity(
+    buf: &mut Buffer,
+    area: Rect,
+    sessions: &[Session],
+    now: u64,
+    spin: usize,
+    collapsed: bool,
+) {
+    let (shown, extra) = if collapsed {
+        (1, " · latest".to_string())
+    } else {
+        (ACTIVITY, format!(" · last {ACTIVITY}"))
+    };
+    let panel = panel(collapsed, ICON_ACTIVITY, "Activity", vec![extra.fg(FAINT)]);
+    let body = draw_panel(buf, panel, area);
     let mut log: Vec<(usize, &Tool)> = sessions
         .iter()
         .enumerate()
         .flat_map(|(i, s)| s.tools.iter().rev().map(move |t| (i + 1, t)))
         .collect();
     log.sort_by_key(|&(_, t)| Reverse(t.at)); // stable: calls from the same second stay newest first
-    log.truncate(ACTIVITY);
+    log.truncate(shown);
     if log.is_empty() {
         empty(buf, body, "no tool calls yet");
         return;
@@ -532,10 +672,20 @@ fn activity_row(
 
 /// What each session read (in) and wrote (out) per column of `secs`, up to `now` (unix ms): two
 /// block histograms per session, one session under the other. Out is about a hundred times smaller
-/// than in, so each has its own scale, shared by every session so their heights compare.
-fn draw_tokens(buf: &mut Buffer, area: Rect, sessions: &[Session], secs: u64, now: u64) {
+/// than in, so each has its own scale, shared by every session so their heights compare. While
+/// collapsed, the strips are 1 row tall instead of `STRIP_ROWS`.
+fn draw_tokens(
+    buf: &mut Buffer,
+    area: Rect,
+    sessions: &[Session],
+    secs: u64,
+    now: u64,
+    collapsed: bool,
+) {
     let label_w = sessions.len().to_string().len();
-    let panel = panel(ICON_TOKENS, "Tokens", vec![" · last minute".fg(FAINT)]);
+    let rows = if collapsed { 1 } else { STRIP_ROWS };
+    let extra = vec![" · last minute".fg(FAINT)];
+    let panel = panel(collapsed, ICON_TOKENS, "Tokens", extra);
     // A column per cell; the rest of the row is the label (`1: out `) and the last minute's count.
     let cells = (panel.inner(area).width as usize).saturating_sub(label_w + 6 + VALUE_W);
     let strips: Vec<_> = sessions
@@ -584,15 +734,7 @@ fn draw_tokens(buf: &mut Buffer, area: Rect, sessions: &[Session], secs: u64, no
             ]
             .into_iter()
             .flat_map(move |(label, strip, top, total, pending)| {
-                token_strip(
-                    &label,
-                    strip,
-                    top,
-                    cells,
-                    STRIP_ROWS,
-                    count(total, si),
-                    pending,
-                )
+                token_strip(&label, strip, top, cells, rows, count(total, si), pending)
             })
             .map(move |l| fade(l, s))
         })
@@ -696,6 +838,7 @@ fn draw_sessions(
     (cols, rows): (usize, usize),
     now: u64,
     spin: usize,
+    collapsed: bool,
 ) {
     let n = sessions.len();
     let legend = vec![
@@ -707,7 +850,7 @@ fn draw_sessions(
         " uncached".fg(MUTED),
     ];
     let badge = vec![" ".into(), format!(" {n} ").fg(BG).bg(ACCENT).bold()];
-    let panel = with_note(panel(ICON_SESSIONS, "Sessions", badge), legend);
+    let panel = with_note(panel(collapsed, ICON_SESSIONS, "Sessions", badge), legend);
     let body = draw_panel(buf, panel, area);
     if n == 0 {
         empty(buf, body, "no sessions");
@@ -715,9 +858,11 @@ fn draw_sessions(
     }
     let label_w = n.to_string().len();
     draw_columns(buf, body, sessions, cols, rows, |n, s, width| {
-        let row = session_row(n, label_w, s, width, spin, now);
-        let info = session_info(label_w, s, width, now / 1000);
-        vec![fade(row, s), fade(info, s)]
+        let mut lines = vec![fade(session_row(n, label_w, s, width, spin, now), s)];
+        if !collapsed {
+            lines.push(fade(session_info(label_w, s, width, now / 1000), s));
+        }
+        lines
     });
 }
 
@@ -744,9 +889,29 @@ fn draw_columns<T>(
     }
 }
 
-/// Every panel: rounded border, an icon + name title, 1 cell of padding left and right.
-fn panel(icon: &'static str, name: &'static str, extra: Vec<Span<'static>>) -> Block<'static> {
-    let mut title = vec![icon.fg(ACCENT), " ".into(), name.fg(TEXT).bold()];
+/// `area` as two columns 2 cells apart, the way `draw_columns` lays out two.
+fn halves(area: Rect) -> [Rect; 2] {
+    Layout::horizontal([Constraint::Fill(1); 2])
+        .spacing(2)
+        .areas(area)
+}
+
+/// Every panel: rounded border, a title of ▾ (▸ while `collapsed`), icon and name, 1 cell of
+/// padding left and right.
+fn panel(
+    collapsed: bool,
+    icon: &'static str,
+    name: &'static str,
+    extra: Vec<Span<'static>>,
+) -> Block<'static> {
+    let fold = if collapsed { COLLAPSED } else { EXPANDED };
+    let mut title = vec![
+        fold.fg(MUTED),
+        " ".into(),
+        icon.fg(ACCENT),
+        " ".into(),
+        name.fg(TEXT).bold(),
+    ];
     title.extend(extra);
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -800,15 +965,25 @@ fn notch(content: Vec<Span<'static>>, border: Color) -> Line<'static> {
 }
 
 /// Each core's load as an htop meter, column-major like Sessions on a `grid` of (cols, rows), then
-/// memory across the whole width.
+/// memory across the whole width. While collapsed, the cores' average and memory side by side.
 fn draw_system(
     buf: &mut Buffer,
     area: Rect,
     m: &Machine,
     (cols, rows): (usize, usize),
     spin: usize,
+    collapsed: bool,
 ) {
-    let body = draw_panel(buf, panel(ICON_SYSTEM, "System", vec![]), area);
+    let body = draw_panel(buf, panel(collapsed, ICON_SYSTEM, "System", vec![]), area);
+    if collapsed {
+        let [cpu, mem] = halves(body);
+        if !m.cpus.is_empty() {
+            let avg = m.cpus.iter().sum::<f64>() / m.cpus.len() as f64;
+            cpu_row("CPU", 3, avg, cpu.width as usize).render(cpu, buf);
+        }
+        mem_row(1, m.memory, mem.width as usize, spin).render(mem, buf);
+        return;
+    }
     let label_w = m.cpus.len().to_string().len();
     if !m.cpus.is_empty() {
         let cores = Rect {
@@ -827,9 +1002,10 @@ fn draw_system(
     mem_row(label_w, m.memory, body.width as usize, spin).render(mem, buf);
 }
 
-/// `3: [|||||||        23.4%]`. A busy core is normal, so unlike the other meters it never warns.
-fn cpu_row(n: usize, label_w: usize, pct: f64, width: usize) -> Line<'static> {
-    let mut spans = Vec::from(row_label(n, label_w));
+/// `3: [|||||||        23.4%]`, or `CPU: […]` for the average. A busy core is normal, so unlike
+/// the other meters it never warns.
+fn cpu_row(label: impl std::fmt::Display, label_w: usize, pct: f64, width: usize) -> Line<'static> {
+    let mut spans = Vec::from(row_label(label, label_w));
     let text = format!("{pct:.1}%");
     let parts = [(pct / 100.0, GREEN)];
     spans.extend(bar(
@@ -855,10 +1031,19 @@ fn mem_row(label_w: usize, (used, total): (u64, u64), width: usize, spin: usize)
 }
 
 /// Bytes sent (↑) and received (↓) per second, as strips like Tokens, one sample per refresh.
-/// Each has its own scale: a download would flatten the uploads next to it.
-fn draw_network(buf: &mut Buffer, area: Rect, m: &Machine) {
-    let panel = panel(ICON_NETWORK, "Network", vec![" · per second".fg(FAINT)]);
-    let cells = (panel.inner(area).width as usize).saturating_sub(1 + 2 + VALUE_W);
+/// Each has its own scale: a download would flatten the uploads next to it. While collapsed, the
+/// two strips are 1 row tall and side by side.
+fn draw_network(buf: &mut Buffer, area: Rect, m: &Machine, collapsed: bool) {
+    let extra = vec![" · per second".fg(FAINT)];
+    let panel = panel(collapsed, ICON_NETWORK, "Network", extra);
+    let inner = panel.inner(area);
+    let (spots, rows) = if collapsed {
+        (halves(inner), 1)
+    } else {
+        let strip = Constraint::Length(STRIP_ROWS as u16);
+        (Layout::vertical([strip; 2]).areas(inner), STRIP_ROWS)
+    };
+    let cells = (spots[0].width as usize).saturating_sub(1 + 2 + VALUE_W);
     let strips = [("↑", &m.up), ("↓", &m.down)].map(|(label, history)| {
         let visible = &history[history.len().saturating_sub(cells)..];
         let peak = visible.iter().copied().max().unwrap_or(0);
@@ -873,24 +1058,14 @@ fn draw_network(buf: &mut Buffer, area: Rect, m: &Machine) {
         .fg(FAINT)
         .italic(),
     ];
-    let body = draw_panel(buf, with_note(panel, note), area);
-    let lines: Vec<Line> = strips
-        .iter()
-        .flat_map(|&(label, visible, scale)| {
-            let last = visible.last().copied().unwrap_or(0);
-            let value = count(last, bytes);
-            token_strip(
-                &row_label(label, 0),
-                visible,
-                scale,
-                cells,
-                STRIP_ROWS,
-                value,
-                0,
-            )
-        })
-        .collect();
-    Paragraph::new(lines).render(body, buf);
+    draw_panel(buf, with_note(panel, note), area);
+    for ((label, visible, scale), spot) in strips.into_iter().zip(spots) {
+        let last = visible.last().copied().unwrap_or(0);
+        let value = count(last, bytes);
+        let label = row_label(label, 0);
+        let lines = token_strip(&label, visible, scale, cells, rows, value, 0);
+        Paragraph::new(lines).render(spot, buf);
+    }
 }
 
 /// Bytes the way htop shows them: 512B, 12.3K, 4.1M, 18.2G, in powers of 1024. It moves up a unit
@@ -910,8 +1085,16 @@ fn bytes(n: f64) -> String {
     format!("{n:.1}T")
 }
 
-fn draw_quota(buf: &mut Buffer, area: Rect, quota: Option<&Quota>, now: u64, spin: usize) {
-    let panel = panel(ICON_LIMITS, "Rate limits", vec![]);
+/// The 5h window above the 7d one, or side by side while collapsed.
+fn draw_quota(
+    buf: &mut Buffer,
+    area: Rect,
+    quota: Option<&Quota>,
+    now: u64,
+    spin: usize,
+    collapsed: bool,
+) {
+    let panel = panel(collapsed, ICON_LIMITS, "Rate limits", vec![]);
     let Some(q) = quota else {
         let body = draw_panel(buf, panel, area);
         empty(
@@ -925,12 +1108,10 @@ fn draw_quota(buf: &mut Buffer, area: Rect, quota: Option<&Quota>, now: u64, spi
     let age = q.updated.elapsed().unwrap_or_default().as_secs();
     let updated = vec![format!("updated {} ago", human(age)).fg(FAINT).italic()];
     let body = draw_panel(buf, with_note(panel, updated), area);
-    let lines: Vec<Line> = q
-        .limits
-        .iter()
-        .map(|l| quota_row(l, now / 1000, body.width as usize, spin))
-        .collect();
-    Paragraph::new(lines).render(body, buf);
+    let (cols, rows) = if collapsed { (2, 1) } else { (1, 2) };
+    draw_columns(buf, body, &q.limits, cols, rows, |_, l, width| {
+        vec![quota_row(l, now / 1000, width, spin)]
+    });
 }
 
 /// (columns, rows) for `n` meters: one more column every ROWS_PER_COL sessions, while they fit.
@@ -1379,4 +1560,79 @@ fn activity_row_fits_its_width() {
     assert_eq!(text(&t, 22), "1: ⠋ Bash cargo… 00:12");
     t.done = Some((103, true));
     assert_eq!(text(&t, 26), "1: ✗ Bash cargo test 00:03");
+}
+
+#[test]
+fn collapsed_panels_are_saved_apart_from_payloads() {
+    let dir = std::env::temp_dir().join(format!("cc-top-collapsed-{}", std::process::id()));
+    let file = collapsed_file(&dir);
+    assert!(load_collapsed(&file).is_empty()); // nothing saved yet: all expanded
+    let shut = HashSet::from([Panel::Repo, Panel::Activity]);
+    save_collapsed(&file, &shut);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "activity\nrepo\n");
+    assert_eq!(load_collapsed(&file), shut);
+    assert!(claude::quota(&dir).is_none()); // the rate limits don't read it as a payload
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn collapsed_panels_show_a_summary() {
+    let tool = |name: &str, at| Tool {
+        id: name.into(),
+        at,
+        name: name.into(),
+        arg: String::new(),
+        done: Some((at + 1, false)),
+        sub: false,
+    };
+    let s = Session {
+        tools: vec![tool("Bash", 100), tool("Read", 101)],
+        ..Default::default()
+    };
+    let mut machine = Machine::new();
+    machine.refresh(HISTORY);
+    let listing = [(PathBuf::new(), vec![("src".to_string(), true)])];
+    let screen = |collapsed: &HashSet<Panel>| {
+        let backend = ratatui::backend::TestBackend::new(80, 60);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut hits = vec![];
+        terminal
+            .draw(|f| {
+                let sessions = std::slice::from_ref(&s);
+                let page = (collapsed, &mut 0);
+                (_, hits) = draw(f, &machine, sessions, None, &listing, (0, 2), page);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        (rows, hits)
+    };
+    let at = |rows: &[String], title: &str| rows.iter().position(|r| r.contains(title)).unwrap();
+
+    let (open, hits) = screen(&HashSet::new());
+    let a = at(&open, " Activity");
+    assert!(open[a].contains("▾ ") && open[a].contains("last 5"));
+    assert!(open[a + 1].contains("Read") && open[a + 2].contains("Bash"));
+    assert!(hits.iter().any(|(_, c)| matches!(c, Click::Open(0, _)))); // the src/ box
+
+    let (shut, hits) = screen(&HashSet::from(Panel::ALL));
+    let below = |title| &shut[at(&shut, title) + 1];
+    assert!(below(" System").contains("CPU: [") && below(" System").contains("M: "));
+    assert!(below(" Network").contains("↑: ") && below(" Network").contains("↓: "));
+    assert!(shut[at(&shut, " Sessions") + 2].contains('╰')); // the meter, no info line
+    assert!(below(" Tokens").contains("in ") && shut[at(&shut, " Tokens") + 2].contains("out "));
+    let a = at(&shut, " Activity");
+    assert!(shut[a].contains("▸ ") && shut[a].contains("latest"));
+    assert!(shut[a + 1].contains("Read") && shut[a + 2].contains('╰'));
+    assert!(!shut.iter().any(|r| r.contains("Bash")));
+    assert!(below(" Repo").contains('╰')); // its title over its bottom border
+    assert!(!hits.iter().any(|(_, c)| matches!(c, Click::Open(..))));
+    // A click on its title expands it: the page starts under the main window's top border.
+    let (fold, _) = hits
+        .iter()
+        .find(|(_, c)| *c == Click::Fold(Panel::Activity))
+        .unwrap();
+    assert_eq!((fold.y as usize, fold.height), (a - 1, 1));
 }
