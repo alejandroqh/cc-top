@@ -13,10 +13,11 @@ Follow this guide for any UI change. The constants live at the top of `src/main.
   `.bg(BG)` too.
 - **Each colour has one meaning per area.** Check the table before reusing one, and add a constant
   rather than tweaking a hex inline.
-- **New panels go through `panel(icon, name, extra)`.** It gives the rounded border, the notched title
-  and 1 cell of padding left and right. A bottom-right note goes through `with_note`, the panel is
-  drawn with `draw_panel`, and an empty state with `empty`. Rows start with `row_label`, and an idle
-  session's rows go through `fade`.
+- **New panels go through `panel(collapsed, icon, name, extra)`.** It gives the rounded border, the
+  notched title with its `▾` / `▸`, and 1 cell of padding left and right. A bottom-right note goes
+  through `with_note`, the panel is drawn with `draw_panel`, and an empty state with `empty`. Rows
+  start with `row_label`, and an idle session's rows go through `fade`. A new panel also needs a
+  `Panel` variant and a summary to show while collapsed (see **Collapsing**).
 - **Warnings go through `level(pct, normal, spin)`**, so every meter warns at the same thresholds.
 - Assume a Nerd Font, but only use Nerd Font glyphs for decoration (icons). Data must stay readable without one.
 
@@ -26,7 +27,7 @@ Follow this guide for any UI change. The constants live at the top of `src/main.
 | -------- | --------- | --------------------------------------------------------------- |
 | `BG`     | `#1a1b26` | background of the whole app                                     |
 | `TEXT`   | `#c0caf5` | primary text: titles, values, busy clock, rate-limit %, session name |
-| `MUTED`  | `#737aa2` | secondary text: legend labels, session %, session info values, reset time, key hints · `in` / `out` labels and in-flight baseline (Tokens) |
+| `MUTED`  | `#737aa2` | secondary text: legend labels, session %, session info values, reset time, key hints, panel `▾` / `▸` · `in` / `out` labels and in-flight baseline (Tokens) |
 | `FAINT`  | `#565f89` | low-priority text: version, `:`, "resets in", "up" / "since" / "tok", idle `·` / `00:00`, empty states |
 | `TRACK`  | `#2c304a` | empty part of every bar                                         |
 | `BORDER` | `#3b4261` | panel borders and their title notches                           |
@@ -135,6 +136,25 @@ scrolls: `↑` / `↓` a row, `PgUp` / `PgDn` a page, the mouse wheel 3 rows. On
 scrollbar show over the main window's right border (an `ACCENT` `┃` thumb on a `FRAME` `│` track),
 and `↑↓ scroll` joins the key hints. The main window's border and title stay put.
 
+**Collapsing.** Every panel's title starts with `▾`. A click anywhere on its top border collapses it
+to a summary, and the title then starts with `▸`; another click expands it. Collapsed panels show:
+
+| Panel       | Collapsed                                                                 |
+| ----------- | ------------------------------------------------------------------------- |
+| System      | `CPU:`, the average of the cores, and `M:` side by side                   |
+| Network     | `↑` and `↓` side by side, each strip 1 row tall                           |
+| Rate limits | `5h` and `7d` side by side                                                |
+| Sessions    | each meter, without its info line                                         |
+| Tokens      | `in` and `out` 1 row tall (8 levels)                                      |
+| Activity    | the newest call only; the title says `latest` instead of `last 5`         |
+| Repo        | the title and note, no boxes. Every Repo panel collapses together         |
+
+Side by side means two columns 2 cells apart (`halves`), as in `draw_columns`, so the `M:` and `7d`
+bars end in the same column, like they do when expanded. Collapsed panels are saved in
+`~/.claude/cc-top/collapsed`, one `Panel::key` per line, so they stay collapsed the next time
+cc-top starts. That file has no extension, so `claude::quota` doesn't read it as a payload and the
+7-day cleanup doesn't delete it.
+
 **Thresholds (`level`).** These apply to the percentage text of every meter except CPU:
 
 | Usage   | Style                                                      |
@@ -161,6 +181,7 @@ blink attribute, because many terminals ignore it (iTerm2 does by default).
 | ------------------ | --------------------------------------------------------------- |
 | `╭─╮ ╰─╯`          | rounded borders on the main window and every panel              |
 | `─┤ title ├─`      | title notch, top-left for names, bottom-right for legends/notes |
+| `▾` `▸`            | panel expanded / collapsed; a click on its title toggles it     |
 | `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`       | busy spinner (one frame per 100 ms), also a running tool call   |
 | `✓` `✗`            | finished / failed tool call                                     |
 | `↳`                | Activity: the call was made by a subagent of that session       |

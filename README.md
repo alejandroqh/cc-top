@@ -49,6 +49,7 @@ cc-top
 | `↑` `↓`, `PgUp` `PgDn`, wheel    | scroll                                         |
 | `+` / `-`                        | zoom the Tokens timeline (1 s to 1 min per column) |
 | click a folder in Repo           | look inside it (`../` goes back)               |
+| click a panel's title (`▾` / `▸`) | collapse it to a summary, or expand it again   |
 
 cc-top captures the mouse, so hold Shift (Option in iTerm2) to select text.
 
@@ -67,7 +68,7 @@ things differ:
 ## Data and uninstall
 
 Everything stays on your machine. cc-top keeps session data in `~/.claude/cc-top/` and deletes
-anything not updated for 7 days.
+any not updated for 7 days. The panels you collapsed are saved there too, in `collapsed`.
 
 ```sh
 cc-top --uninstall    # removes the status line, the opencode plugin and the saved data
