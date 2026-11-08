@@ -4,6 +4,8 @@ A terminal dashboard in the style of top for AI coding agents. It shows live con
 rate limits and file activity for Claude Code and opencode sessions, next to the CPU, memory and
 network of the machine they run on.
 
+![cc-top showing a Claude Code session: System, Network, Rate limits, Sessions, Tokens, Activity and Repo panels](assets/screenshot.png)
+
 ## Features
 
 - **Sessions**: context usage for each session, plus its model, effort, uptime, tokens and lines changed
