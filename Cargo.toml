@@ -1,6 +1,6 @@
 [package]
 name = "cc-top"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A terminal dashboard in the style of top for AI coding agents. It shows live context, token usage, rate limits and file activity."
 license = "Apache-2.0"
